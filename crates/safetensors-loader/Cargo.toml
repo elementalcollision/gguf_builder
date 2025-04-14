@@ -5,10 +5,11 @@ edition = "2021"
 
 [dependencies]
 safetensors = "0.5.3"
-memmap2 = "0.9"      # For memory mapping files
-# thiserror = "1.0"    # Removed due to proc-macro issues
+# memmap2 = "0.9" # No longer needed after switching from mmap
 anyhow = "1.0"       # Using anyhow for simpler error handling
 log = "0.4"          # For logging
+serde = { version = "1.0", features = ["derive"] } # For index.json parsing
+serde_json = "1.0" # For index.json parsing
 
 [dev-dependencies]
 tempfile = "3.10"
