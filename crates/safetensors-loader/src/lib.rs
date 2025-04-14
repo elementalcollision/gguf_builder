@@ -7,7 +7,7 @@ use std::{self, collections::HashMap};
 use std::io::Read;
 use serde::Deserialize;
 use std::cell::RefCell;
-use std::sync::Arc;
+use memmap2::Mmap;
 
 // Structs for parsing model.safetensors.index.json
 #[derive(Deserialize, Debug, Clone)]
@@ -28,7 +28,7 @@ pub struct SafeTensorsModel {
     // Optional mapping from tensor name to shard filename
     weight_map: Option<HashMap<String, String>>,
     // Cache for loaded shard buffers (Path -> Buffer)
-    loaded_shard_cache: RefCell<HashMap<PathBuf, Arc<Vec<u8>>>>,
+    loaded_shard_cache: RefCell<HashMap<PathBuf, Mmap>>,
 }
 
 impl SafeTensorsModel {
@@ -47,9 +47,7 @@ impl SafeTensorsModel {
         self.weight_map.as_ref()
     }
 
-    /// Finds the shard containing the tensor, loads it (using cache), and provides the TensorView to a closure.
-    /// The TensorView is only valid within the closure `func` due to borrowing from a temporary buffer.
-    /// The caller must provide the correct `shard_filename` where the tensor resides.
+    /// Finds the shard containing the tensor, loads it (using mmap cache), and provides the TensorView.
     pub fn get_tensor_view<F, R>(
         &self, 
         tensor_name: &str, 
@@ -62,44 +60,44 @@ impl SafeTensorsModel {
         let shard_path = self.model_dir.join(shard_filename);
         log::debug!("Requesting tensor '{}' from shard: {:?}", tensor_name, shard_path);
 
-        // --- Buffer Loading with Cache --- 
-        let buffer_arc: Arc<Vec<u8>>;
+        // --- Mmap Loading with Cache (Restructured for Lifetimes) --- 
+        // Declare borrow guard holder outside the if/else
+        let cache_guard: std::cell::Ref<'_, HashMap<PathBuf, Mmap>>;
+        let mmap_slice: &[u8];
+
         // Check cache first (read-only borrow)
-        let cached_buffer = self.loaded_shard_cache.borrow().get(&shard_path).cloned();
-        
-        if let Some(arc) = cached_buffer {
-            log::trace!("Cache hit for shard: {:?}", shard_path);
-            buffer_arc = arc;
-        } else {
-            // Cache miss - load from disk
-            log::trace!("Cache miss for shard: {:?}. Loading from disk...", shard_path);
+        if !self.loaded_shard_cache.borrow().contains_key(&shard_path) {
+             // Cache miss - mmap the file and insert
+            log::trace!("Cache miss for shard: {:?}. Memory mapping...", shard_path);
             if !shard_path.exists() {
                 bail!("Provided shard file not found: {:?} (for tensor '{}')", shard_path, tensor_name);
             }
-            let loaded_buffer = {
-                let mut file = File::open(&shard_path)
-                    .with_context(|| format!("Failed to open shard file: {}", shard_path.display()))?;
-                let mut buffer = Vec::new();
-                // Consider adding file size hint buffer.with_capacity(file.metadata()?.len() as usize);
-                file.read_to_end(&mut buffer)
-                    .with_context(|| format!("Failed to read shard file content: {}", shard_path.display()))?;
-                log::trace!("Loaded {} bytes from shard {:?}", buffer.len(), shard_path);
-                buffer
-            };
             
-            // Wrap in Arc and insert into cache (mutable borrow)
-            buffer_arc = Arc::new(loaded_buffer);
-            // Use block to ensure mutable borrow is dropped quickly
-            {
-                let mut cache = self.loaded_shard_cache.borrow_mut();
-                cache.insert(shard_path.clone(), buffer_arc.clone());
-                log::trace!("Cached buffer for shard: {:?}", shard_path);
-            }
-        }
-        // --- End Buffer Loading --- 
+            let file = File::open(&shard_path)
+                .with_context(|| format!("Failed to open shard file: {}", shard_path.display()))?;
+            
+            let loaded_mmap = unsafe {
+                Mmap::map(&file)
+                    .with_context(|| format!("Failed to memory map shard file: {}", shard_path.display()))?
+            };
+            log::trace!("Memory mapped shard {:?} ({} bytes)", shard_path, loaded_mmap.len());
 
-        // Now deserialize header and get view from the buffer_arc
-        let metadata = SafeTensors::deserialize(&buffer_arc) // Borrow from Arc
+            // Insert into cache (mutable borrow, dropped immediately after insert)
+            self.loaded_shard_cache.borrow_mut().insert(shard_path.clone(), loaded_mmap);
+            log::trace!("Cached memory map for shard: {:?}", shard_path);
+            // Implicit drop of mutable borrow here
+        }
+
+        // Now, whether it was a hit or miss (and inserted), the key exists.
+        // Obtain the immutable borrow guard and hold it.
+        cache_guard = self.loaded_shard_cache.borrow(); 
+        // Get the slice from the Mmap inside the cache, borrowing from the guard.
+        mmap_slice = cache_guard.get(&shard_path).unwrap(); // Must exist now
+        // --- End Mmap Loading --- 
+
+        // Deserialize header and get view using the mmap_slice
+        // `mmap_slice` is valid because `cache_guard` is still in scope.
+        let metadata = SafeTensors::deserialize(mmap_slice)
              .map_err(|e: SafeTensorError| anyhow::anyhow!(e)) 
              .with_context(|| format!("Failed to deserialize header from shard: {:?}", shard_path))?;
         
@@ -111,6 +109,7 @@ impl SafeTensorsModel {
         // Execute the closure with the borrowed view
         let result = func(view)?;
 
+        // Borrows held by `cache_guard` are dropped here automatically
         Ok(result)
     }
     

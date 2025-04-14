@@ -10,10 +10,11 @@ anyhow = "1.0"       # Using anyhow for simpler error handling
 log = "0.4"          # For logging
 serde = { version = "1.0", features = ["derive"] } # For index.json parsing
 serde_json = "1.0" # For index.json parsing
+memmap2 = "0.9" # Add memmap2
 
 [dev-dependencies]
-tempfile = "3.10"
-rand = "0.8"
+tempfile = "3.10.1"
+rand = "0.8.5"
 # Need safetensors again to create test files
-safetensors = { version = "0.5.3" }
-bytemuck = { version = "1", features = ["derive"] } # For test assertions
+# safetensors = { version = "0.5.3", features = ["serialize"] } # Feature removed
+bytemuck = "1.16.1" # For test assertions
