@@ -3,9 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::fs::{self, File};
 use std::io::BufWriter;
-use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
 
 // Import our library crates
 use safetensors_loader::{load_safetensors, SafeTensorDtype, SafeTensorsModel};
@@ -30,20 +28,6 @@ struct Args {
 
     // TODO: Add arguments for specific GGUF metadata (architecture, etc.)
     // TODO: Add arguments for quantization options if needed later
-}
-
-// Simple struct to deserialize known config fields later
-// For now, we parse into a generic JsonValue
-#[derive(Deserialize, Debug)]
-struct ModelConfig {
-    // Example fields - add more as needed
-    #[serde(default)]
-    architecture: Option<String>,
-    #[serde(default)]
-    model_type: Option<String>,
-    // Catch-all for other fields
-    #[serde(flatten)]
-    _other: HashMap<String, JsonValue>,
 }
 
 // Helper function to get the GGUF architecture prefix from config names
@@ -77,16 +61,6 @@ fn get_string(config: &JsonValue, key: &str) -> Result<Option<String>> {
         Some(val) => val.as_str()
             .ok_or_else(|| anyhow::anyhow!("Metadata key '{}' is not a valid string", key))
             .map(|s| Some(s.to_string())),
-        None => Ok(None), // Key not present
-    }
-}
-
-// Helper to extract a bool value from JSON
-fn get_bool(config: &JsonValue, key: &str) -> Result<Option<bool>> {
-    match config.get(key) {
-        Some(val) => val.as_bool()
-            .ok_or_else(|| anyhow::anyhow!("Metadata key '{}' is not a valid boolean", key))
-            .map(Some),
         None => Ok(None), // Key not present
     }
 }
@@ -327,57 +301,78 @@ fn build_gguf(model: &SafeTensorsModel, output_path: &PathBuf, config_data: Opti
     }
 
     // --- 2. Prepare Tensor Info and Data ---
-    let mut tensor_data_slices: Vec<&[u8]> = Vec::new();
-    let mut processed_tensor_count = 0; // Renamed to avoid confusion with total count
+    let mut tensor_data_slices: Vec<Vec<u8>> = Vec::new(); // Store owned Vec<u8> temporarily
+    let mut processed_tensor_count = 0;
 
-    // Handle Result before iterating
-    for item in model.tensors()? {
-        let (name, view) = item; // Destructure the tuple from the iterator
-        log::debug!(
-            "Processing tensor: {} | Type: {:?} | Shape: {:?}",
-            name, view.dtype(), view.shape()
-        );
+    // Get the tensor iterator (handle Result before loop)
+    let tensor_iterator = model.tensors()?;
+
+    // Iterate over tensors (yields (String, String) - name, shard_filename)
+    for item in tensor_iterator {
+        // item is now (String, String)
+        let (name, shard_filename): (String, String) = item; // name is owned String
         
-        let ggml_type = match view.dtype() {
-            SafeTensorDtype::F64 => GGMLTypeRenamed::F64,
-            SafeTensorDtype::F32 => GGMLTypeRenamed::F32,
-            SafeTensorDtype::F16 => GGMLTypeRenamed::F16,
-            SafeTensorDtype::BF16 => GGMLTypeRenamed::BF16,
-            SafeTensorDtype::I64 => GGMLTypeRenamed::I64,
-            SafeTensorDtype::I32 => GGMLTypeRenamed::I32,
-            SafeTensorDtype::I16 => GGMLTypeRenamed::I16,
-            SafeTensorDtype::I8 => GGMLTypeRenamed::I8,
-            // TODO: Handle U8, U16, U32, U64 if needed and GGUF supports them
-            // TODO: Map quantized types if input can be quantized
-            other => {
-                log::warn!("Unsupported tensor type {:?} for tensor '{}'. Skipping.", other, name);
-                continue; // Skip unsupported tensors for now
-                // Alternatively, could try to convert (e.g., F64 -> F32) but that requires allocation
-                // bail!("Unsupported tensor type {:?} for GGUF conversion", other);
-            }
-        };
+        let mut tensor_info: Option<GGUFTensorInfo> = None;
+        let mut tensor_data: Option<Vec<u8>> = None;
 
-        let info = GGUFTensorInfo {
-            name: name.clone(),
-            // Convert usize shape dimensions to u64
-            dimensions: view.shape().iter().map(|&d| d as u64).collect(),
-            ggml_type,
-            offset: 0, // Writer calculates this
-        };
+        // Use get_tensor_view, passing the shard_filename
+        model.get_tensor_view(&name, &shard_filename, |view| {
+            log::debug!(
+                "Processing tensor: {} (from {}) | Type: {:?} | Shape: {:?}",
+                name, shard_filename, view.dtype(), view.shape()
+            );
+            
+            let ggml_type = match view.dtype() {
+                SafeTensorDtype::F64 => GGMLTypeRenamed::F64,
+                SafeTensorDtype::F32 => GGMLTypeRenamed::F32,
+                SafeTensorDtype::F16 => GGMLTypeRenamed::F16,
+                SafeTensorDtype::BF16 => GGMLTypeRenamed::BF16,
+                SafeTensorDtype::I64 => GGMLTypeRenamed::I64,
+                SafeTensorDtype::I32 => GGMLTypeRenamed::I32,
+                SafeTensorDtype::I16 => GGMLTypeRenamed::I16,
+                SafeTensorDtype::I8 => GGMLTypeRenamed::I8,
+                other => {
+                    // Use bail! within the closure? Need to check error handling.
+                    // For now, log and skip, setting Option to None
+                    log::warn!("Unsupported tensor type {:?} for tensor '{}'. Skipping.", other, name);
+                    return Ok(()); // Indicate skipping this tensor within the closure
+                }
+            };
 
-        gguf_writer.add_tensor_info(info);
-        tensor_data_slices.push(view.data());
-        processed_tensor_count += 1;
+            // Create tensor info within the closure
+            tensor_info = Some(GGUFTensorInfo {
+                name: name.clone(),
+                dimensions: view.shape().iter().map(|&d| d as u64).collect(),
+                ggml_type,
+                offset: 0, // Writer calculates this
+            });
+
+            // Copy tensor data into an owned Vec<u8> within the closure
+            tensor_data = Some(view.data().to_vec());
+
+            Ok(()) // Return Ok from the closure
+        })?;
+
+        // Add info and data if they were successfully extracted
+        if let (Some(info), Some(data)) = (tensor_info, tensor_data) {
+            gguf_writer.add_tensor_info(info);
+            tensor_data_slices.push(data); // Add the owned Vec<u8>
+            processed_tensor_count += 1;
+        } else {
+             log::warn!("Skipping tensor '{}' due to processing error or unsupported type.", name);
+        }
     }
     log::info!("Prepared {} tensors for GGUF writing.", processed_tensor_count);
 
     // --- 3. Write GGUF File ---
     let file = File::create(output_path)
         .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
-    // Use BufWriter for potentially better performance
     let mut writer = BufWriter::new(file);
 
-    gguf_writer.write(&mut writer, &tensor_data_slices)
+    // Convert Vec<Vec<u8>> to Vec<&[u8]> for the writer
+    let tensor_data_ref_slices: Vec<&[u8]> = tensor_data_slices.iter().map(|v| v.as_slice()).collect();
+
+    gguf_writer.write(&mut writer, &tensor_data_ref_slices)
         .with_context(|| format!("Failed to write GGUF data to: {:?}", output_path))?;
 
     log::info!("Successfully wrote GGUF file to: {:?}", output_path);

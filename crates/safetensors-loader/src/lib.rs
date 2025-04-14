@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 use std::{self, collections::HashMap};
 use std::io::Read;
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 // Structs for parsing model.safetensors.index.json
 #[derive(Deserialize, Debug, Clone)]
@@ -25,56 +27,16 @@ pub struct SafeTensorsModel {
     shard_paths: Vec<PathBuf>,
     // Optional mapping from tensor name to shard filename
     weight_map: Option<HashMap<String, String>>,
-
-    // --- Data for the currently loaded shard --- 
-    // TODO: Refactor to handle lazy loading without storing the buffer directly here.
-    // For now, keep storing the first shard buffer to minimize changes.
-    _buffer: Vec<u8>,
-    loaded_shard_path: PathBuf, 
+    // Cache for loaded shard buffers (Path -> Buffer)
+    loaded_shard_cache: RefCell<HashMap<PathBuf, Arc<Vec<u8>>>>,
 }
 
 impl SafeTensorsModel {
-    /// Returns an iterator over the tensor names and views FROM THE CURRENTLY LOADED SHARD.
-    /// Deserializes the header on each call.
-    pub fn tensors(&self) -> Result<impl Iterator<Item = (String, TensorView<'_>)>> {
-        // Deserialize the header from the owned buffer on the fly.
-        // The returned SafeTensors object borrows from self._buffer.
-        let metadata = SafeTensors::deserialize(&self._buffer)
-            .map_err(|e: SafeTensorError| anyhow::anyhow!(e)) 
-            .with_context(|| format!("Failed to deserialize SafeTensors header from buffer of shard: {:?}", self.loaded_shard_path))?;
-        // into_iter yields (String, TensorView<_'>)
-        Ok(metadata.tensors().into_iter())
-    }
-
-    /// Gets a specific tensor by name FROM THE CURRENTLY LOADED SHARD.
-    /// Deserializes the header on each call.
-    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
-        // Deserialize the header from the owned buffer on the fly.
-        let metadata = SafeTensors::deserialize(&self._buffer)
-            .map_err(|e: SafeTensorError| anyhow::anyhow!(e))
-            .with_context(|| format!("Failed to deserialize SafeTensors header from buffer of shard: {:?}", self.loaded_shard_path))?;
-        // The view returned here borrows from self._buffer
-        metadata
-            .tensor(name)
-            .map_err(|e: SafeTensorError| anyhow::anyhow!(e))
-            .with_context(|| format!("Tensor '{}' not found in currently loaded shard: {:?}", name, self.loaded_shard_path))
-    }
-
     /// Gets the path to the model directory.
     pub fn path(&self) -> &Path {
         &self.model_dir
     }
-
-    /// Gets the path to the currently loaded shard file.
-    pub fn current_shard_path(&self) -> &Path {
-        &self.loaded_shard_path
-    }
-
-    /// Returns the raw byte buffer of the currently loaded shard.
-    pub fn buffer(&self) -> &[u8] {
-        &self._buffer
-    }
-
+    
     /// Returns the list of discovered shard paths.
     pub fn shard_paths(&self) -> &[PathBuf] {
         &self.shard_paths
@@ -84,11 +46,129 @@ impl SafeTensorsModel {
     pub fn weight_map(&self) -> Option<&HashMap<String, String>> {
         self.weight_map.as_ref()
     }
+
+    /// Finds the shard containing the tensor, loads it (using cache), and provides the TensorView to a closure.
+    /// The TensorView is only valid within the closure `func` due to borrowing from a temporary buffer.
+    /// The caller must provide the correct `shard_filename` where the tensor resides.
+    pub fn get_tensor_view<F, R>(
+        &self, 
+        tensor_name: &str, 
+        shard_filename: &str,
+        func: F
+    ) -> Result<R>
+    where
+        F: FnOnce(TensorView<'_>) -> Result<R>,
+    {
+        let shard_path = self.model_dir.join(shard_filename);
+        log::debug!("Requesting tensor '{}' from shard: {:?}", tensor_name, shard_path);
+
+        // --- Buffer Loading with Cache --- 
+        let buffer_arc: Arc<Vec<u8>>;
+        // Check cache first (read-only borrow)
+        let cached_buffer = self.loaded_shard_cache.borrow().get(&shard_path).cloned();
+        
+        if let Some(arc) = cached_buffer {
+            log::trace!("Cache hit for shard: {:?}", shard_path);
+            buffer_arc = arc;
+        } else {
+            // Cache miss - load from disk
+            log::trace!("Cache miss for shard: {:?}. Loading from disk...", shard_path);
+            if !shard_path.exists() {
+                bail!("Provided shard file not found: {:?} (for tensor '{}')", shard_path, tensor_name);
+            }
+            let loaded_buffer = {
+                let mut file = File::open(&shard_path)
+                    .with_context(|| format!("Failed to open shard file: {}", shard_path.display()))?;
+                let mut buffer = Vec::new();
+                // Consider adding file size hint buffer.with_capacity(file.metadata()?.len() as usize);
+                file.read_to_end(&mut buffer)
+                    .with_context(|| format!("Failed to read shard file content: {}", shard_path.display()))?;
+                log::trace!("Loaded {} bytes from shard {:?}", buffer.len(), shard_path);
+                buffer
+            };
+            
+            // Wrap in Arc and insert into cache (mutable borrow)
+            buffer_arc = Arc::new(loaded_buffer);
+            // Use block to ensure mutable borrow is dropped quickly
+            {
+                let mut cache = self.loaded_shard_cache.borrow_mut();
+                cache.insert(shard_path.clone(), buffer_arc.clone());
+                log::trace!("Cached buffer for shard: {:?}", shard_path);
+            }
+        }
+        // --- End Buffer Loading --- 
+
+        // Now deserialize header and get view from the buffer_arc
+        let metadata = SafeTensors::deserialize(&buffer_arc) // Borrow from Arc
+             .map_err(|e: SafeTensorError| anyhow::anyhow!(e)) 
+             .with_context(|| format!("Failed to deserialize header from shard: {:?}", shard_path))?;
+        
+        let view = metadata
+            .tensor(tensor_name)
+            .map_err(|e: SafeTensorError| anyhow::anyhow!(e))
+            .with_context(|| format!("Tensor '{}' not found within its shard file: {:?}", tensor_name, shard_path))?; 
+
+        // Execute the closure with the borrowed view
+        let result = func(view)?;
+
+        Ok(result)
+    }
+    
+    /// Returns an iterator over (tensor name, shard filename) pairs.
+    /// Uses the index file if available. If no index file exists, it scans the header
+    /// of every shard file to determine tensor locations (less efficient).
+    pub fn tensors(&self) -> Result<impl Iterator<Item = (String, String)> + '_> {
+        match &self.weight_map {
+            Some(map) => {
+                // Index available: Clone the map data for the iterator
+                log::debug!("Providing tensor list from index file.");
+                let data: Vec<(String, String)> = map.clone().into_iter().collect();
+                Ok(data.into_iter())
+            },
+            None => {
+                // No index: Scan all shard headers
+                log::warn!("No index file found. Scanning all shard headers to build tensor list (this might be slow).");
+                let mut all_tensor_info: Vec<(String, String)> = Vec::new();
+
+                for shard_path in &self.shard_paths {
+                    let shard_filename = shard_path.file_name()
+                        .and_then(|os_str| os_str.to_str())
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get filename for shard: {:?}", shard_path))?
+                        .to_string();
+                    
+                    log::trace!("Scanning header of shard: {}", shard_filename);
+                    
+                    // Load shard header
+                    let buffer = {
+                        let mut file = File::open(&shard_path)
+                            .with_context(|| format!("Failed to open shard file for header scan: {}", shard_path.display()))?;
+                        // Optimization: Only read enough bytes for the header?
+                        // For simplicity now, read the whole shard again. Caching would help here.
+                        let mut buffer = Vec::new(); 
+                        file.read_to_end(&mut buffer)
+                            .with_context(|| format!("Failed to read shard file content for header scan: {}", shard_path.display()))?;
+                        buffer
+                    };
+
+                    let metadata = SafeTensors::deserialize(&buffer)
+                        .map_err(|e: SafeTensorError| anyhow::anyhow!(e)) 
+                        .with_context(|| format!("Failed to deserialize header during scan of shard: {:?}", shard_path))?;
+                    
+                    // Collect tensor names from this shard
+                    for (tensor_name, _view) in metadata.tensors() {
+                        log::trace!(" Found tensor '{}' in shard {}", tensor_name, shard_filename);
+                        all_tensor_info.push((tensor_name.clone(), shard_filename.clone()));
+                    }
+                }
+                log::debug!("Finished scanning shard headers. Found {} tensors total.", all_tensor_info.len());
+                Ok(all_tensor_info.into_iter())
+            }
+        }
+    }
 }
 
-/// Loads the first shard of a SafeTensors model from the specified directory 
-/// and attempts to parse the index file if present.
-/// TODO: Implement full sharded loading.
+/// Loads SafeTensors model metadata (shard paths, index) from the specified directory.
+/// Does not load tensor data itself.
 pub fn load_safetensors(model_dir: &Path) -> Result<SafeTensorsModel> {
     log::info!("Scanning for safetensors shards in directory: {:?}", model_dir);
 
@@ -142,7 +222,8 @@ pub fn load_safetensors(model_dir: &Path) -> Result<SafeTensorsModel> {
         log::info!("Index file not found at {:?}. Will rely on iterating shards.", index_path);
     }
 
-    // --- Load the first shard (Temporary) --- 
+    // --- REMOVE loading the first shard --- 
+    /*
     let first_shard_path = shard_paths[0].clone();
     log::info!("Loading first shard for initial access: {:?}", first_shard_path);
 
@@ -157,13 +238,23 @@ pub fn load_safetensors(model_dir: &Path) -> Result<SafeTensorsModel> {
         .map_err(|e: SafeTensorError| anyhow::anyhow!(e))
         .with_context(|| format!("Failed initial validation of safetensors format in shard: {}", first_shard_path.display()))?;
     log::info!("Successfully validated first shard safetensors format.");
+    */
+    
+    if shard_paths.is_empty() {
+         // This check was already present, but ensure it stays
+         bail!("No .safetensors files found in directory: {}", model_dir.display());
+    }
+    log::info!("Safetensors metadata loaded. Found {} shards {}.", 
+        shard_paths.len(), 
+        if weight_map.is_some() { "and an index file" } else { "without an index file" }
+    );
 
     Ok(SafeTensorsModel {
         model_dir: model_dir.to_path_buf(),
         shard_paths,
         weight_map,
-        _buffer: buffer, // Store the buffer for the first shard (TEMPORARY)
-        loaded_shard_path: first_shard_path, // Store path of loaded shard (TEMPORARY)
+        // Initialize empty cache
+        loaded_shard_cache: RefCell::new(HashMap::new()), 
     })
 }
 
@@ -182,8 +273,8 @@ mod tests {
     use safetensors::tensor::TensorView as SafeTensorView; // Use alias for clarity
     use safetensors::Dtype as SafeTensorDtype; // Use alias for clarity
 
-    // Comment out helper function requiring serialize
-    // /*
+    // Remove commented out helper function requiring serialize
+    /*
     fn create_dummy_safetensor_file(path: &Path, tensors: &HashMap<String, SafeTensorView>) {
         // We need serialize feature for tests, temporarily enable or skip
         // let metadata = safetensors::serialize(tensors, &None).expect("Failed to serialize tensors");
@@ -192,9 +283,9 @@ mod tests {
         std::fs::write(path, b"dummy safetensor data").expect("Failed to write dummy file");
         println!("Warning: Wrote dummy data to {:?}, test results may be inaccurate.", path);
     }
-    // */
+    */
 
-    // Test structure needs rework for directory input
+    // Remove commented out test needing rework
     /*
     #[test]
     fn test_load_safetensors_success_single_shard() {
@@ -249,7 +340,7 @@ mod tests {
         assert!(result.err().unwrap().to_string().contains("No .safetensors files found"));
     }
     
-    // Comment out test requiring the helper - needs rework for directory structure
+    // Remove commented out test needing rework
     /*
     #[test]
     fn test_load_safetensors_invalid_file() {
@@ -262,7 +353,7 @@ mod tests {
     }
     */
     
-    // Comment out test requiring the helper - needs rework for directory structure
+    // Remove commented out test needing rework
     /*
     #[test]
     fn test_get_non_existent_tensor() {
