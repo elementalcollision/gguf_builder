@@ -1,0 +1,18 @@
+[package]
+name = "safetensors-loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+safetensors = "0.5.3"
+memmap2 = "0.9"      # For memory mapping files
+# thiserror = "1.0"    # Removed due to proc-macro issues
+anyhow = "1.0"       # Using anyhow for simpler error handling
+log = "0.4"          # For logging
+
+[dev-dependencies]
+tempfile = "3.10"
+rand = "0.8"
+# Need safetensors again to create test files
+safetensors = { version = "0.5.3" }
+bytemuck = { version = "1", features = ["derive"] } # For test assertions

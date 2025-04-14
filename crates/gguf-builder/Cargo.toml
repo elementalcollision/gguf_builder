@@ -1,0 +1,13 @@
+[package]
+name = "gguf-builder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# gguf-swiss-core removed as we will implement GGUF writing ourselves
+safetensors = "0.5.3"
+anyhow = "1.0"
+byteorder = "1.5"
+half = { version = "2.4", features = ["serde"] }
+log = "0.4"
+thiserror = "1.0"

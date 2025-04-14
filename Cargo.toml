@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    ".", # The main binary package
+    "crates/*", # All crates within the crates directory
+]
+
+resolver = "2" # Use the version 2 resolver
+
+# Optional: Define shared workspace dependencies later if needed
+# [workspace.dependencies]
+# some_dependency = "1.0"
+
+# Add back the package definition for the main binary
+[package]
+name = "ggml-builder" # Changed to kebab-case as recommended
+version = "0.1.0"
+edition = "2021" # Sticking with 2021 for broader compatibility unless 2024 is specifically needed
+
+[dependencies]
+# Dependencies for the main binary will go here
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+reqwest = { version = "0.12", features = ["json", "stream"] } # Optional: If downloading models
+anyhow = "1.0"
+
+# Workspace crates
+core-logic = { path = "crates/core-logic" }
+safetensors-loader = { path = "crates/safetensors-loader" }
+gguf-builder = { path = "crates/gguf-builder" }
+# mlx-builder = { path = "crates/mlx-builder" }
